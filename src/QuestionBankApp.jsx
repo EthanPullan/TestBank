@@ -475,7 +475,9 @@ async function loadSeedBank() {
   const empty = { questions: [], groups: {}, images: {} };
   const base = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.BASE_URL) || "/";
   const grab = async (name) => {
-    try { const r = await fetch(base + name, { cache: "no-store" }); return r.ok ? await r.json() : null; }
+    // Cache-bust so an updated published bank shows up within seconds instead of
+    // waiting out GitHub Pages' fixed 10-minute edge cache.
+    try { const r = await fetch(base + name + "?ts=" + Date.now(), { cache: "no-store" }); return r.ok ? await r.json() : null; }
     catch (e) { return null; }
   };
   const data = (await grab("seed-bank.json")) || (await grab("seed-questions.json"));
@@ -742,8 +744,9 @@ export default function QuestionBankApp() {
   /* ---- load ---- */
   useEffect(() => {
     (async () => {
-      const [qs, st, ts, gr, subs] = await Promise.all([jGet("bank:questions"), jGet("bank:settings"), jGet("bank:tests"), jGet("bank:groups"), jGet("bank:submissions")]);
-      if (qs && Array.isArray(qs)) {
+      const [qs, st, ts, gr, subs, pseen] = await Promise.all([jGet("bank:questions"), jGet("bank:settings"), jGet("bank:tests"), jGet("bank:groups"), jGet("bank:submissions"), jGet("bank:pubSeen")]);
+      const haveBank = qs && Array.isArray(qs);
+      if (haveBank) {
         setQuestions(qs);
       } else {
         // First visit: seed everyone from the maintainer's published bank,
@@ -753,6 +756,7 @@ export default function QuestionBankApp() {
           for (const imgId of Object.keys(seed.images)) await rawSet("img:" + imgId, seed.images[imgId]);
           setQuestions(seed.questions); await jSet("bank:questions", seed.questions);
           if (Object.keys(seed.groups).length) { setGroups(seed.groups); await jSet("bank:groups", seed.groups); }
+          await jSet("bank:pubSeen", seed.questions.map(q => q.id));
         }
       }
       if (st) setSettings({ teacher: "", school: "", courses: [], ...st });
@@ -764,6 +768,31 @@ export default function QuestionBankApp() {
         if (typeof window !== "undefined" && new URLSearchParams(window.location.search).get("admin") === "1") setAdmin(true);
       } catch (e) { /* ignore */ }
       setLoaded(true);
+
+      // Returning visit: quietly pull in anything published since last time so a
+      // refresh reflects back-end updates — without wiping local edits or
+      // resurrecting questions removed on this device (tracked in bank:pubSeen).
+      if (haveBank) {
+        const seed = await loadSeedBank();
+        if (seed.questions.length) {
+          const seen = new Set(Array.isArray(pseen) ? pseen : []);
+          const have = new Set(qs.map(q => q.id));
+          const add = seed.questions.filter(q => !have.has(q.id) && !seen.has(q.id));
+          if (add.length) {
+            const baseGroups = (gr && typeof gr === "object" && !Array.isArray(gr)) ? gr : {};
+            const neededGroups = [...new Set(add.map(q => q.groupId).filter(Boolean))];
+            const nextGroups = { ...baseGroups };
+            neededGroups.forEach(gid => { if (seed.groups[gid] && !nextGroups[gid]) nextGroups[gid] = seed.groups[gid]; });
+            for (const q of add) if (q.imageId && seed.images[q.imageId]) await rawSet("img:" + q.imageId, seed.images[q.imageId]);
+            for (const gid of neededGroups) { const g = seed.groups[gid]; if (g && g.imageId && seed.images[g.imageId]) await rawSet("img:" + g.imageId, seed.images[g.imageId]); }
+            const nextQuestions = [...add, ...qs];
+            setQuestions(nextQuestions); await jSet("bank:questions", nextQuestions);
+            if (Object.keys(nextGroups).length !== Object.keys(baseGroups).length) { setGroups(nextGroups); await jSet("bank:groups", nextGroups); }
+            say(`Added ${add.length} newly published question${add.length === 1 ? "" : "s"}`);
+          }
+          await jSet("bank:pubSeen", [...new Set([...seen, ...seed.questions.map(q => q.id)])]);
+        }
+      }
     })();
   }, []);
 
@@ -2529,7 +2558,7 @@ function SettingsTab({ settings, onSave, onWipe, questionsCount, submissions, ad
       <div className="index-card p-4 grid gap-2">
         <div className="qb-stamp" style={{ color: PEN_RED, marginTop: 2 }}>Published bank</div>
         <p className="text-sm" style={{ color: INK_SOFT }}>
-          New visitors start from the published bank in <code>public/seed-bank.json</code> (questions, diagrams, and question-sets). Pull in anything newly published, or export your current bank to that file and commit it to publish to everyone.
+          New visitors start from the published bank in <code>public/seed-bank.json</code> (questions, diagrams, and question-sets). Returning visitors pick up newly published questions automatically on reload — tap <i>Sync</i> to force a check now. Export your current bank to that file and commit it to publish to everyone.
         </p>
         <div className="flex gap-2 flex-wrap">
           <button className="qb-btn" onClick={onSyncPublished}><RefreshCw size={15} /> Sync published questions</button>
