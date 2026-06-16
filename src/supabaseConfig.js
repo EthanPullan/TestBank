@@ -10,8 +10,8 @@
 // key — to switch every teacher over to the one shared, live bank.
 // ---------------------------------------------------------------------------
 
-export const SUPABASE_URL = "";
-export const SUPABASE_ANON_KEY = "";
+export const SUPABASE_URL = "https://fjnnregdvlosbpmykbwm.supabase.co";
+export const SUPABASE_ANON_KEY = "sb_publishable_uytMtdzl_TK68tnDJxSqqQ_2CcCBxtz";
 
 // True once both values are present; the rest of the app keys off this.
 export const SHARED_BANK_ENABLED = Boolean(SUPABASE_URL && SUPABASE_ANON_KEY);
