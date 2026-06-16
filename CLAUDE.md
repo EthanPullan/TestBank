@@ -5,7 +5,8 @@ tests. Vite + React + Tailwind. Deployed to GitHub Pages by
 `.github/workflows/deploy.yml` on every push to `main`. Base path `/TestBank/`.
 Live: https://ethanpullan.github.io/TestBank/
 
-- **Develop on branch `claude/festive-planck-goyx6z`**; pushing to `main` auto-deploys.
+- **Develop on the session's feature branch, then merge to `main`**; pushing to
+  `main` auto-deploys.
 - Build/verify: `npm install` then `npm run build` (outputs `dist/`). Preview:
   `npm run preview -- --port 4318` then GET `http://localhost:4318/TestBank/`.
 
@@ -38,14 +39,28 @@ Live: https://ethanpullan.github.io/TestBank/
   → seeds the shared bank at rev 1; others pull on reload. A recoverable copy is
   stashed to `bank:localBackup` before the shared bank ever replaces local data.
 
-## Status / next step (2026-06-16)
-Shared bank is deployed live; keys are in `src/supabaseConfig.js`. NOT yet
-verified end-to-end because the sandbox couldn't reach `*.supabase.co` (env egress
-allowlist). To verify:
-1. Ensure `*.supabase.co` is in the environment's egress allowlist (a mid-session
-   change needs a NEW session to take effect).
-2. Run the infra checks (expected: auth health `200`; anon read of `bank` → `[]`
-   due to RLS; anon insert → denied; bogus sign-in → `400` invalid credentials):
+## Status (verified live 2026-06-16)
+Shared bank is deployed **and verified end-to-end**. Infra checks (run against the
+project URL + publishable key) all pass:
+- auth health `/auth/v1/health` → `200`
+- anon read `rest/v1/bank` → `[]` (RLS hides rows from anon; the table exists and
+  is exposed — a missing table would `404`, not `[]`)
+- anon insert → `401` "new row violates row-level security policy"
+- anon update of `id=main` → `[]` (0 rows; RLS blocks anon writes)
+- bogus sign-in → `400` invalid credentials
+
+In-browser teacher flow confirmed live: sign-in → auto-pull rev 0 → **Publish →
+rev 1** with `updated_by` recorded. The `main` row now holds the real bank at
+revision 1.
+
+**Gotcha for any fresh setup:** `publishBank` is UPDATE-only (`update().eq('id',
+'main').eq('revision', expected)`), so the `id='main'` row MUST pre-exist at
+`revision 0` or the first Publish matches 0 rows and throws a *misleading*
+"conflict" toast. The row is already seeded here, so this is handled — but a brand
+new project needs `insert into public.bank (id, data, revision) values ('main',
+'{}'::jsonb, 0)` first (or change `publishBank` to upsert + add an INSERT policy).
+
+Infra re-check (anytime egress allows `*.supabase.co`):
 
    ```bash
    URL=https://fjnnregdvlosbpmykbwm.supabase.co
@@ -54,8 +69,6 @@ allowlist). To verify:
    curl -s -w '\n%{http_code}\n' "$URL/rest/v1/bank?select=id,revision" -H "apikey: $KEY" -H "Authorization: Bearer $KEY"
    curl -s -X POST "$URL/auth/v1/token?grant_type=password" -H "apikey: $KEY" -H "Content-Type: application/json" -d '{"email":"nobody@example.com","password":"x"}' -w '\n%{http_code}\n'
    ```
-3. The signed-in Publish/Pull must be tested in-browser (no teacher credential in
-   the repo) OR with a throwaway teacher login the owner provides.
 
 Rollback: blanking the two values in `src/supabaseConfig.js` instantly returns
 everyone to file mode with no data loss.
