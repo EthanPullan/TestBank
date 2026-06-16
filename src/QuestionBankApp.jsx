@@ -467,20 +467,27 @@ function buildSubmissionIssueUrl(q, submitter) {
 }
 
 /* ---------------- published-bank seed ----------------
-   On a fresh visit the bank is empty; load the questions the maintainer has
-   published in public/seed-questions.json so everyone starts with the shared set. */
-async function loadSeedQuestions() {
-  try {
-    const base = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.BASE_URL) || "/";
-    const res = await fetch(base + "seed-questions.json", { cache: "no-store" });
-    if (!res.ok) return [];
-    const data = await res.json();
-    const arr = Array.isArray(data) ? data : (data && Array.isArray(data.questions) ? data.questions : null);
-    if (!arr) return [];
-    return arr
-      .filter(raw => raw && raw.text)
-      .map(raw => ({ ...blankQuestion(), ...raw, id: raw.id || uid("q"), createdAt: raw.createdAt || todayISO(), lastUsed: null }));
-  } catch (e) { return []; }
+   On a fresh visit the bank is empty; load what the maintainer has published so
+   everyone starts with the shared set. Prefer a full backup (public/seed-bank.json
+   — questions + question-sets + diagrams) and fall back to a questions-only
+   public/seed-questions.json. IDs are preserved so re-syncing never duplicates. */
+async function loadSeedBank() {
+  const empty = { questions: [], groups: {}, images: {} };
+  const base = (typeof import.meta !== "undefined" && import.meta.env && import.meta.env.BASE_URL) || "/";
+  const grab = async (name) => {
+    try { const r = await fetch(base + name, { cache: "no-store" }); return r.ok ? await r.json() : null; }
+    catch (e) { return null; }
+  };
+  const data = (await grab("seed-bank.json")) || (await grab("seed-questions.json"));
+  if (!data) return empty;
+  const arr = Array.isArray(data) ? data : (Array.isArray(data.questions) ? data.questions : null);
+  if (!arr) return empty;
+  const questions = arr
+    .filter(raw => raw && raw.text)
+    .map(raw => ({ ...blankQuestion(), ...raw, id: raw.id || uid("q"), createdAt: raw.createdAt || todayISO(), lastUsed: null }));
+  const groups = (!Array.isArray(data) && data.groups && typeof data.groups === "object" && !Array.isArray(data.groups)) ? data.groups : {};
+  const images = (!Array.isArray(data) && data.images && typeof data.images === "object") ? data.images : {};
+  return { questions, groups, images };
 }
 
 /* ---------------- print CSS (shared with HTML download) ---------------- */
@@ -739,9 +746,14 @@ export default function QuestionBankApp() {
       if (qs && Array.isArray(qs)) {
         setQuestions(qs);
       } else {
-        // First visit: start everyone from the maintainer's published seed bank.
-        const seeded = await loadSeedQuestions();
-        if (seeded.length) { setQuestions(seeded); await jSet("bank:questions", seeded); }
+        // First visit: seed everyone from the maintainer's published bank,
+        // restoring its question-sets and diagrams (not just the question text).
+        const seed = await loadSeedBank();
+        if (seed.questions.length) {
+          for (const imgId of Object.keys(seed.images)) await rawSet("img:" + imgId, seed.images[imgId]);
+          setQuestions(seed.questions); await jSet("bank:questions", seed.questions);
+          if (Object.keys(seed.groups).length) { setGroups(seed.groups); await jSet("bank:groups", seed.groups); }
+        }
       }
       if (st) setSettings({ teacher: "", school: "", courses: [], ...st });
       if (ts && Array.isArray(ts)) setTests(ts);
@@ -878,29 +890,46 @@ export default function QuestionBankApp() {
   }, [say]);
 
   const syncPublished = useCallback(async () => {
-    const seeded = await loadSeedQuestions();
-    if (!seeded.length) { say("No published questions found.", "warn"); return; }
+    const seed = await loadSeedBank();
+    if (!seed.questions.length) { say("No published questions found.", "warn"); return; }
     const have = new Set(questions.map(q => q.id));
-    const add = seeded.filter(q => !have.has(q.id));
+    const add = seed.questions.filter(q => !have.has(q.id));
     if (!add.length) { say("Already up to date with the published bank."); return; }
+    // Bring along the diagrams and question-sets the new questions rely on.
+    const neededGroups = [...new Set(add.map(q => q.groupId).filter(Boolean))];
+    const nextGroups = { ...groups };
+    neededGroups.forEach(gid => { if (seed.groups[gid] && !nextGroups[gid]) nextGroups[gid] = seed.groups[gid]; });
+    for (const q of add) if (q.imageId && seed.images[q.imageId]) await rawSet("img:" + q.imageId, seed.images[q.imageId]);
+    for (const gid of neededGroups) { const g = seed.groups[gid]; if (g && g.imageId && seed.images[g.imageId]) await rawSet("img:" + g.imageId, seed.images[g.imageId]); }
+    if (Object.keys(nextGroups).length !== Object.keys(groups).length) saveGroups(nextGroups);
     saveQuestions([...add, ...questions]);
     say(`Added ${add.length} newly published question${add.length === 1 ? "" : "s"}`);
-  }, [questions, saveQuestions, say]);
+  }, [questions, groups, saveQuestions, saveGroups, say]);
 
-  const exportSeed = useCallback(() => {
-    const clean = questions.map(q => {
-      const c = JSON.parse(JSON.stringify(q));
-      delete c.lastUsed;
-      return c;
-    });
-    const blob = new Blob([JSON.stringify(clean, null, 2)], { type: "application/json" });
+  // Export the whole bank as a full backup named seed-bank.json — commit it to
+  // public/ to publish these questions (with their diagrams and question-sets)
+  // to every visitor.
+  const exportSeed = useCallback(async () => {
+    const clean = questions.map(q => { const c = JSON.parse(JSON.stringify(q)); delete c.lastUsed; return c; });
+    const usedGroupIds = [...new Set(questions.map(q => q.groupId).filter(Boolean))];
+    const groupsSubset = {};
+    usedGroupIds.forEach(gid => { if (groups[gid]) groupsSubset[gid] = groups[gid]; });
+    const images = {};
+    for (const q of questions) if (q.imageId) { const d = await getImage(q.imageId); if (d) images[q.imageId] = d; }
+    for (const gid of usedGroupIds) { const gImg = groups[gid] && groups[gid].imageId; if (gImg) { const d = await getImage(gImg); if (d) images[gImg] = d; } }
+    const payload = {
+      app: "question-bank", version: 1, exportedAt: new Date().toISOString(),
+      settings: { courses: [...new Set(questions.map(q => q.course).filter(Boolean))] },
+      questions: clean, groups: groupsSubset, images,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 1)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
-    a.download = "seed-questions.json";
+    a.download = "seed-bank.json";
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    say(`Exported ${clean.length} question${clean.length === 1 ? "" : "s"} as seed-questions.json`);
-  }, [questions, say]);
+    say(`Exported ${clean.length} question${clean.length === 1 ? "" : "s"} as seed-bank.json`);
+  }, [questions, groups, getImage, say]);
 
   /* ---- import / export ---- */
   const doImport = useCallback(async (text) => {
@@ -2500,11 +2529,11 @@ function SettingsTab({ settings, onSave, onWipe, questionsCount, submissions, ad
       <div className="index-card p-4 grid gap-2">
         <div className="qb-stamp" style={{ color: PEN_RED, marginTop: 2 }}>Published bank</div>
         <p className="text-sm" style={{ color: INK_SOFT }}>
-          New visitors start from the published set in <code>public/seed-questions.json</code>. Pull in anything newly published, or export your current bank to that file and commit it to publish to everyone.
+          New visitors start from the published bank in <code>public/seed-bank.json</code> (questions, diagrams, and question-sets). Pull in anything newly published, or export your current bank to that file and commit it to publish to everyone.
         </p>
         <div className="flex gap-2 flex-wrap">
           <button className="qb-btn" onClick={onSyncPublished}><RefreshCw size={15} /> Sync published questions</button>
-          <button className="qb-btn" onClick={onExportSeed}><Download size={15} /> Export seed-questions.json</button>
+          <button className="qb-btn" onClick={onExportSeed}><Download size={15} /> Export seed-bank.json</button>
         </div>
       </div>
 

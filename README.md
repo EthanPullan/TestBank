@@ -47,9 +47,11 @@ Because the site is static (no server), submissions flow through **GitHub issues
    - **Settings → Moderation** → paste the issue's JSON block → *Approve pasted question(s)*, or
    - any locally-submitted suggestion can be approved/rejected directly in the queue.
 4. Approving adds the question to the maintainer's bank. To **publish it to every
-   visitor**, use **Settings → Published bank → Export `seed-questions.json`** and
-   commit the file to `public/seed-questions.json`. New visitors are seeded from it,
-   and returning visitors can pull updates with *Sync published questions*.
+   visitor**, use **Settings → Published bank → Export `seed-bank.json`** and commit
+   the file to `public/seed-bank.json` (a full backup — questions, diagrams, and
+   question-sets). New visitors are seeded from it, and returning visitors can pull
+   updates with *Sync published questions*. (A questions-only `public/seed-questions.json`
+   is also accepted as a fallback.)
 
 ### Moderation access
 
@@ -75,7 +77,7 @@ src/main.jsx               Mounts the app
 src/QuestionBankApp.jsx    The whole application
 src/config.js              Repo owner/name, submission label, moderation passphrase
 src/index.css              Tailwind entry
-public/seed-questions.json The published starter bank everyone sees on first visit
+public/seed-bank.json      The published bank everyone sees on first visit (full backup)
 .github/workflows/deploy.yml                      Build + deploy to GitHub Pages
 .github/ISSUE_TEMPLATE/question-submission.yml    Manual submission form
 ```
