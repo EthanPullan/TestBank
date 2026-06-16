@@ -1,0 +1,53 @@
+name: Question submission
+description: Suggest a question for the Question Bank (a maintainer reviews it before it is added).
+title: "[Question submission] "
+labels: ["question-submission"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a question! A maintainer will review it before it is published.
+
+        The easiest way to submit is the **"Suggest a question"** form in the app — it fills
+        this issue in for you, including the JSON block the maintainer imports with one click.
+        You can also fill it in by hand below.
+  - type: input
+    id: submitter
+    attributes:
+      label: Your name (optional)
+      placeholder: e.g. Ms. Nguyen
+  - type: dropdown
+    id: type
+    attributes:
+      label: Question type
+      options:
+        - Multiple choice
+        - Numeric response
+        - True / False
+        - Matching
+        - Written response
+    validations:
+      required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Question text
+      description: The question as it should appear on a test.
+    validations:
+      required: true
+  - type: textarea
+    id: answer
+    attributes:
+      label: Answer / key
+      description: The correct answer (and the other options, for multiple choice).
+  - type: input
+    id: course
+    attributes:
+      label: Course / unit
+      placeholder: e.g. Science 9 · Electricity
+  - type: textarea
+    id: json
+    attributes:
+      label: Question JSON
+      description: Auto-filled by the app — the maintainer imports this to approve. Leave it as-is.
+      render: json
