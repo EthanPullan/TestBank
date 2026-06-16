@@ -3,9 +3,10 @@ import {
   Plus, Trash2, Pencil, Printer, Download, Upload, Search, X, ChevronUp,
   ChevronDown, Image as ImageIcon, Copy, Check, FileText, Settings as SettingsIcon,
   BookOpen, ClipboardList, Shuffle, AlertTriangle, Dice5, Eye, Link2,
-  Send, ShieldCheck, Clock, RefreshCw, Inbox, ExternalLink
+  Send, ShieldCheck, Clock, RefreshCw, Inbox, ExternalLink, LogIn
 } from "lucide-react";
 import { GITHUB_OWNER, GITHUB_REPO, SUBMISSION_LABEL, ADMIN_PASSPHRASE } from "./config";
+import { sharedBankEnabled, getSession, onAuthChange, signIn, signOut, fetchBank, publishBank } from "./sharedBank";
 
 /* ============================================================
    Question Bank — a teacher's filing cabinet for test questions
@@ -748,9 +749,10 @@ export default function QuestionBankApp() {
       const haveBank = qs && Array.isArray(qs);
       if (haveBank) {
         setQuestions(qs);
-      } else {
-        // First visit: seed everyone from the maintainer's published bank,
-        // restoring its question-sets and diagrams (not just the question text).
+      } else if (!sharedBankEnabled) {
+        // First visit (file mode only): seed everyone from the maintainer's
+        // published bank, restoring its question-sets and diagrams (not just the
+        // question text). In shared-bank mode the Supabase pull seeds instead.
         const seed = await loadSeedBank();
         if (seed.questions.length) {
           for (const imgId of Object.keys(seed.images)) await rawSet("img:" + imgId, seed.images[imgId]);
@@ -769,10 +771,10 @@ export default function QuestionBankApp() {
       } catch (e) { /* ignore */ }
       setLoaded(true);
 
-      // Returning visit: quietly pull in anything published since last time so a
-      // refresh reflects back-end updates — without wiping local edits or
-      // resurrecting questions removed on this device (tracked in bank:pubSeen).
-      if (haveBank) {
+      // Returning visit (file mode only): quietly pull in anything published
+      // since last time so a refresh reflects back-end updates — without wiping
+      // local edits or resurrecting questions removed on this device.
+      if (haveBank && !sharedBankEnabled) {
         const seed = await loadSeedBank();
         if (seed.questions.length) {
           const seen = new Set(Array.isArray(pseen) ? pseen : []);
@@ -935,10 +937,10 @@ export default function QuestionBankApp() {
     say(`Added ${add.length} newly published question${add.length === 1 ? "" : "s"}`);
   }, [questions, groups, saveQuestions, saveGroups, say]);
 
-  // Export the whole bank as a full backup named seed-bank.json — commit it to
-  // public/ to publish these questions (with their diagrams and question-sets)
-  // to every visitor.
-  const exportSeed = useCallback(async () => {
+  // Collect the whole bank — questions, their diagrams, the question-sets they
+  // use, and the course list — into one portable object. Shared by the file
+  // backup and the Supabase publish so the two stay byte-for-byte identical.
+  const buildBankPayload = useCallback(async () => {
     const clean = questions.map(q => { const c = JSON.parse(JSON.stringify(q)); delete c.lastUsed; return c; });
     const usedGroupIds = [...new Set(questions.map(q => q.groupId).filter(Boolean))];
     const groupsSubset = {};
@@ -946,19 +948,111 @@ export default function QuestionBankApp() {
     const images = {};
     for (const q of questions) if (q.imageId) { const d = await getImage(q.imageId); if (d) images[q.imageId] = d; }
     for (const gid of usedGroupIds) { const gImg = groups[gid] && groups[gid].imageId; if (gImg) { const d = await getImage(gImg); if (d) images[gImg] = d; } }
-    const payload = {
-      app: "question-bank", version: 1, exportedAt: new Date().toISOString(),
-      settings: { courses: [...new Set(questions.map(q => q.course).filter(Boolean))] },
-      questions: clean, groups: groupsSubset, images,
-    };
+    return { questions: clean, groups: groupsSubset, images, courses: [...new Set(questions.map(q => q.course).filter(Boolean))] };
+  }, [questions, groups, getImage]);
+
+  // Export the whole bank as a full backup named seed-bank.json.
+  const exportSeed = useCallback(async () => {
+    const p = await buildBankPayload();
+    const payload = { app: "question-bank", version: 1, exportedAt: new Date().toISOString(), settings: { courses: p.courses }, questions: p.questions, groups: p.groups, images: p.images };
     const blob = new Blob([JSON.stringify(payload, null, 1)], { type: "application/json" });
     const a = document.createElement("a");
     a.href = URL.createObjectURL(blob);
     a.download = "seed-bank.json";
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 4000);
-    say(`Exported ${clean.length} question${clean.length === 1 ? "" : "s"} as seed-bank.json`);
-  }, [questions, groups, getImage, say]);
+    say(`Exported ${p.questions.length} question${p.questions.length === 1 ? "" : "s"} as seed-bank.json`);
+  }, [buildBankPayload, say]);
+
+  /* ---------------- shared bank (Supabase) ----------------
+     Teachers sign in to one shared, live bank; a publish from any teacher shows
+     up for the others on their next reload. Inert unless supabaseConfig is set. */
+  const [session, setSession] = useState(null);
+  const [sharedInfo, setSharedInfo] = useState(null);   // { revision, updatedAt, updatedBy }
+  const [sharedBusy, setSharedBusy] = useState(false);
+  const sharedRevRef = useRef(0);
+  const sharedPulledRef = useRef(false);
+
+  // Load a fetched bank into the app: write its diagrams, then its questions,
+  // question-sets and course list, persisting locally so it survives reloads.
+  const applyBank = useCallback(async (bank) => {
+    const imgs = (bank && bank.images) || {};
+    for (const id of Object.keys(imgs)) await rawSet("img:" + id, imgs[id]);
+    const qs = Array.isArray(bank && bank.questions) ? bank.questions.map(raw => ({ ...blankQuestion(), ...raw, lastUsed: null })) : [];
+    const gr = (bank && bank.groups && typeof bank.groups === "object" && !Array.isArray(bank.groups)) ? bank.groups : {};
+    setQuestions(qs); await jSet("bank:questions", qs);
+    setGroups(gr); await jSet("bank:groups", gr);
+    if (Array.isArray(bank && bank.courses)) {
+      setSettings(s => { const next = { ...s, courses: [...new Set([...(s.courses || []), ...bank.courses])] }; jSet("bank:settings", next); return next; });
+    }
+  }, []);
+
+  const pullShared = useCallback(async () => {
+    if (!sharedBankEnabled) return;
+    setSharedBusy(true);
+    try {
+      const bank = await fetchBank();
+      if (!bank) return;
+      const incoming = bank.data || {};
+      const hasIncoming = Array.isArray(incoming.questions) && incoming.questions.length > 0;
+      if (hasIncoming) {
+        // Keep a recoverable copy of anything local before the shared bank replaces it.
+        if (questions.length) await jSet("bank:localBackup", { questions, groups, savedAt: new Date().toISOString() });
+        await applyBank(incoming);
+        say(`Loaded shared bank · rev ${bank.revision}`);
+      } else if (questions.length) {
+        say("Shared bank is empty — Publish to populate it.");
+      }
+      sharedRevRef.current = bank.revision;
+      setSharedInfo({ revision: bank.revision, updatedAt: bank.updatedAt, updatedBy: bank.updatedBy });
+    } catch (e) {
+      say("Couldn't load the shared bank: " + (e.message || e), "warn");
+    } finally { setSharedBusy(false); }
+  }, [questions, groups, applyBank, say]);
+
+  const publishShared = useCallback(async () => {
+    if (!sharedBankEnabled) return;
+    if (!session) { say("Sign in to publish.", "warn"); return; }
+    setSharedBusy(true);
+    try {
+      const payload = await buildBankPayload();
+      const who = session.user && session.user.email;
+      const { revision } = await publishBank(payload, sharedRevRef.current, who);
+      sharedRevRef.current = revision;
+      setSharedInfo({ revision, updatedAt: new Date().toISOString(), updatedBy: who });
+      say(`Published to shared bank · rev ${revision}`);
+    } catch (e) {
+      say(e.code === "conflict" ? e.message : "Publish failed: " + (e.message || e), "warn");
+    } finally { setSharedBusy(false); }
+  }, [session, buildBankPayload, say]);
+
+  const sharedSignIn = useCallback(async (email, password) => {
+    try { const s = await signIn(email, password); setSession(s); say("Signed in"); return true; }
+    catch (e) { say("Sign-in failed: " + (e.message || e), "warn"); return false; }
+  }, [say]);
+
+  const sharedSignOut = useCallback(async () => {
+    try { await signOut(); } catch (e) { /* ignore */ }
+    setSession(null); say("Signed out");
+  }, [say]);
+
+  // Restore an existing session on load and track sign-in/out.
+  useEffect(() => {
+    if (!sharedBankEnabled) return;
+    let unsub = () => {};
+    (async () => {
+      setSession(await getSession());
+      unsub = await onAuthChange((s) => setSession(s));
+    })();
+    return () => { try { unsub(); } catch (e) { /* ignore */ } };
+  }, []);
+
+  // Once signed in (including a session restored on reload), pull the shared bank.
+  useEffect(() => {
+    if (!sharedBankEnabled) return;
+    if (session && !sharedPulledRef.current) { sharedPulledRef.current = true; pullShared(); }
+    if (!session) sharedPulledRef.current = false;
+  }, [session, pullShared]);
 
   /* ---- import / export ---- */
   const doImport = useCallback(async (text) => {
@@ -1280,6 +1374,14 @@ export default function QuestionBankApp() {
             onImport={doImport}
             onSyncPublished={syncPublished}
             onExportSeed={exportSeed}
+            sharedEnabled={sharedBankEnabled}
+            session={session}
+            sharedInfo={sharedInfo}
+            sharedBusy={sharedBusy}
+            onSharedSignIn={sharedSignIn}
+            onSharedSignOut={sharedSignOut}
+            onPublishShared={publishShared}
+            onPullShared={pullShared}
           />
         )}
       </main>
@@ -2496,11 +2598,14 @@ function TestsTab({ tests, questionsById, onOpen, onEdit, onExportTest, onDelete
 }
 
 /* ---------------- Settings tab ---------------- */
-function SettingsTab({ settings, onSave, onWipe, questionsCount, submissions, admin, onUnlock, onApprove, onReject, onClearReviewed, onImport, onSyncPublished, onExportSeed }) {
+function SettingsTab({ settings, onSave, onWipe, questionsCount, submissions, admin, onUnlock, onApprove, onReject, onClearReviewed, onImport, onSyncPublished, onExportSeed, sharedEnabled, session, sharedInfo, sharedBusy, onSharedSignIn, onSharedSignOut, onPublishShared, onPullShared }) {
   const [local, setLocal] = useState(settings);
   const [newCourse, setNewCourse] = useState("");
   const [confirmWipe, setConfirmWipe] = useState(false);
+  const [signinEmail, setSigninEmail] = useState("");
+  const [signinPw, setSigninPw] = useState("");
   useEffect(() => setLocal(settings), [settings]);
+  const fmtWhen = (iso) => { try { return iso ? new Date(iso).toLocaleString() : "—"; } catch (e) { return "—"; } };
 
   return (
     <div className="max-w-xl grid gap-5">
@@ -2554,17 +2659,53 @@ function SettingsTab({ settings, onSave, onWipe, questionsCount, submissions, ad
         )}
       </div>
 
-      {/* Published bank */}
-      <div className="index-card p-4 grid gap-2">
-        <div className="qb-stamp" style={{ color: PEN_RED, marginTop: 2 }}>Published bank</div>
-        <p className="text-sm" style={{ color: INK_SOFT }}>
-          New visitors start from the published bank in <code>public/seed-bank.json</code> (questions, diagrams, and question-sets). Returning visitors pick up newly published questions automatically on reload — tap <i>Sync</i> to force a check now. Export your current bank to that file and commit it to publish to everyone.
-        </p>
-        <div className="flex gap-2 flex-wrap">
-          <button className="qb-btn" onClick={onSyncPublished}><RefreshCw size={15} /> Sync published questions</button>
-          <button className="qb-btn" onClick={onExportSeed}><Download size={15} /> Export seed-bank.json</button>
+      {/* Shared bank */}
+      {sharedEnabled ? (
+        <div className="index-card p-4 grid gap-2">
+          <div className="qb-stamp" style={{ color: PEN_RED, marginTop: 2 }}>Shared bank</div>
+          {session ? (
+            <>
+              <p className="text-sm" style={{ color: INK_SOFT }}>
+                Signed in as <b>{session.user && session.user.email}</b>. Edit questions as usual, then <b>Publish</b> to push them to every teacher — they'll see your changes on their next reload.
+              </p>
+              <p className="text-sm" style={{ color: INK_SOFT }}>
+                Shared bank: {sharedInfo ? <>rev <b>{sharedInfo.revision}</b> · updated {fmtWhen(sharedInfo.updatedAt)}{sharedInfo.updatedBy ? <> by {sharedInfo.updatedBy}</> : null}</> : "loading…"}
+              </p>
+              <div className="flex gap-2 flex-wrap items-center">
+                <button className="qb-btn qb-btn-red" onClick={onPublishShared} disabled={sharedBusy}><Upload size={15} /> Publish to shared bank</button>
+                <button className="qb-btn" onClick={onPullShared} disabled={sharedBusy}><RefreshCw size={15} /> Pull latest</button>
+                <button className="qb-btn" onClick={onExportSeed}><Download size={15} /> Download backup</button>
+                <button className="qb-btn qb-btn-ghost" onClick={onSharedSignOut} style={{ marginLeft: "auto" }}>Sign out</button>
+              </div>
+            </>
+          ) : (
+            <>
+              <p className="text-sm" style={{ color: INK_SOFT }}>
+                Sign in to load and publish the shared question bank. Ask the bank owner to create you a teacher account.
+              </p>
+              <form
+                className="flex gap-2 flex-wrap items-center"
+                onSubmit={async (e) => { e.preventDefault(); const ok = await onSharedSignIn(signinEmail.trim(), signinPw); if (ok) { setSigninEmail(""); setSigninPw(""); } }}
+              >
+                <input className="qb-input" type="email" autoComplete="username" placeholder="teacher@email" value={signinEmail} onChange={(e) => setSigninEmail(e.target.value)} style={{ minWidth: 180 }} />
+                <input className="qb-input" type="password" autoComplete="current-password" placeholder="password" value={signinPw} onChange={(e) => setSigninPw(e.target.value)} style={{ minWidth: 140 }} />
+                <button className="qb-btn qb-btn-red" type="submit" disabled={sharedBusy || !signinEmail || !signinPw}><LogIn size={15} /> Sign in</button>
+              </form>
+            </>
+          )}
         </div>
-      </div>
+      ) : (
+        <div className="index-card p-4 grid gap-2">
+          <div className="qb-stamp" style={{ color: PEN_RED, marginTop: 2 }}>Published bank</div>
+          <p className="text-sm" style={{ color: INK_SOFT }}>
+            New visitors start from the published bank in <code>public/seed-bank.json</code> (questions, diagrams, and question-sets). Returning visitors pick up newly published questions automatically on reload — tap <i>Sync</i> to force a check now. Export your current bank to that file and commit it to publish to everyone.
+          </p>
+          <div className="flex gap-2 flex-wrap">
+            <button className="qb-btn" onClick={onSyncPublished}><RefreshCw size={15} /> Sync published questions</button>
+            <button className="qb-btn" onClick={onExportSeed}><Download size={15} /> Export seed-bank.json</button>
+          </div>
+        </div>
+      )}
 
       {/* Moderation queue */}
       <ModerationPanel
