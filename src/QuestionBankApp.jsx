@@ -6,7 +6,7 @@ import {
   Send, ShieldCheck, Clock, RefreshCw, Inbox, ExternalLink, LogIn
 } from "lucide-react";
 import { GITHUB_OWNER, GITHUB_REPO, SUBMISSION_LABEL, ADMIN_PASSPHRASE } from "./config";
-import { sharedBankEnabled, getSession, onAuthChange, signIn, signOut, fetchBank, publishBank } from "./sharedBank";
+import { sharedBankEnabled, getSession, onAuthChange, signIn, signOut, fetchBank, publishBank, listTests, upsertTest, deleteTest, isMissingTableError } from "./sharedBank";
 
 /* ============================================================
    Question Bank — a teacher's filing cabinet for test questions
@@ -970,8 +970,11 @@ export default function QuestionBankApp() {
   const [session, setSession] = useState(null);
   const [sharedInfo, setSharedInfo] = useState(null);   // { revision, updatedAt, updatedBy }
   const [sharedBusy, setSharedBusy] = useState(false);
+  const [migrateTests, setMigrateTests] = useState(null); // { tests:[...] } one-time "push local tests" prompt
   const sharedRevRef = useRef(0);
   const sharedPulledRef = useRef(false);
+  const testsPulledRef = useRef(false);          // first shared-tests pull after sign-in done?
+  const testsMissingWarnedRef = useRef(false);   // don't nag before the tests table exists
 
   // Load a fetched bank into the app: write its diagrams, then its questions,
   // question-sets and course list, persisting locally so it survives reloads.
@@ -1009,6 +1012,49 @@ export default function QuestionBankApp() {
       say("Couldn't load the shared bank: " + (e.message || e), "warn");
     } finally { setSharedBusy(false); }
   }, [questions, groups, applyBank, say]);
+
+  // Load shared tests and merge with any local-only ones (made before sync, or
+  // not yet pushed). Remote wins for rows on both sides. Quietly stays
+  // local-only if the `tests` table isn't set up yet.
+  const pullTests = useCallback(async () => {
+    if (!sharedBankEnabled) return;
+    let remote;
+    try {
+      remote = await listTests();
+    } catch (e) {
+      if (!isMissingTableError(e) && !testsMissingWarnedRef.current) {
+        testsMissingWarnedRef.current = true;
+        say("Couldn't load shared tests: " + (e.message || e), "warn");
+      }
+      return;
+    }
+    const remoteIds = new Set(remote.map(t => t.id));
+    const localArr = (await jGet("bank:tests")) || [];   // canonical local copy, race-proof vs. the async first load
+    const localOnly = (Array.isArray(localArr) ? localArr : []).filter(t => !remoteIds.has(t.id));
+    const merged = [...remote, ...localOnly];
+    setTests(merged); await jSet("bank:tests", merged);
+    // First pull after sign-in: offer once to push any local-only tests up.
+    if (!testsPulledRef.current) {
+      testsPulledRef.current = true;
+      if (localOnly.length) setMigrateTests({ tests: localOnly });
+    }
+  }, [say]);
+
+  // One-time migration: push the teacher's local-only tests to the shared table.
+  const pushLocalTests = useCallback(async (list) => {
+    const email = session && session.user && session.user.email;
+    let pushed = 0;
+    for (const t of list) {
+      try { await upsertTest({ ...t, ownerEmail: email }, email); pushed++; }
+      catch (e) { /* skip any that won't write */ }
+    }
+    setMigrateTests(null);
+    if (pushed) { say(`Pushed ${pushed} test${pushed === 1 ? "" : "s"} to the shared bank`); await pullTests(); }
+    else say("Couldn't push tests — is the shared tests table set up?", "warn");
+  }, [session, say, pullTests]);
+
+  // "Pull latest" refreshes both the question bank and the shared tests.
+  const pullEverything = useCallback(async () => { await pullShared(); await pullTests(); }, [pullShared, pullTests]);
 
   const publishShared = useCallback(async () => {
     if (!sharedBankEnabled) return;
@@ -1050,9 +1096,9 @@ export default function QuestionBankApp() {
   // Once signed in (including a session restored on reload), pull the shared bank.
   useEffect(() => {
     if (!sharedBankEnabled) return;
-    if (session && !sharedPulledRef.current) { sharedPulledRef.current = true; pullShared(); }
-    if (!session) sharedPulledRef.current = false;
-  }, [session, pullShared]);
+    if (session && !sharedPulledRef.current) { sharedPulledRef.current = true; pullShared(); pullTests(); }
+    if (!session) { sharedPulledRef.current = false; testsPulledRef.current = false; }
+  }, [session, pullShared, pullTests]);
 
   /* ---- import / export ---- */
   const doImport = useCallback(async (text) => {
@@ -1248,13 +1294,20 @@ export default function QuestionBankApp() {
   const finalizeTest = useCallback((test) => {
     const stamped = questions.map(q => test.questionIds.includes(q.id) ? { ...q, lastUsed: todayISO() } : q);
     saveQuestions(stamped);
-    const rec = { ...test, id: test.id || uid("t"), createdAt: test.createdAt || todayISO() };
+    const email = (sharedBankEnabled && session && session.user && session.user.email) || null;
+    const rec = { ...test, id: test.id || uid("t"), createdAt: test.createdAt || todayISO(), ...(email ? { ownerEmail: email } : {}) };
     const nextTests = tests.some(t => t.id === rec.id) ? tests.map(t => t.id === rec.id ? rec : t) : [rec, ...tests];
     saveTests(nextTests);
     setEditTest(null);
     setPrintJob({ test: rec });
     say("Test saved — last-used dates stamped");
-  }, [questions, saveQuestions, tests, saveTests, say]);
+    // Best-effort mirror to the shared tests table when signed in.
+    if (email) {
+      upsertTest(rec, email).then(() => pullTests()).catch((e) => {
+        if (!isMissingTableError(e)) say("Saved locally; shared copy didn't sync: " + (e.message || e), "warn");
+      });
+    }
+  }, [questions, saveQuestions, tests, saveTests, say, session, pullTests]);
 
   /* ============================ render ============================ */
   if (printJob) {
@@ -1348,10 +1401,19 @@ export default function QuestionBankApp() {
           <TestsTab
             tests={tests}
             questionsById={questionsById}
+            myEmail={session && session.user ? session.user.email : null}
             onOpen={(t) => setPrintJob({ test: t })}
             onEdit={(t) => { setEditTest(t); setTab("build"); say("Loaded \u201c" + t.title + "\u201d for editing"); }}
+            onDuplicate={(t) => {
+              const copy = { ...t, id: undefined, createdAt: undefined, updatedAt: undefined, ownerEmail: undefined, ownerId: undefined, title: (t.title || "Test") + " (copy)" };
+              setEditTest(copy); setTab("build"); say("Duplicated \u201c" + (t.title || "test") + "\u201d \u2014 edit and save your own copy");
+            }}
             onExportTest={exportTest}
-            onDelete={(id) => { saveTests(tests.filter(t => t.id !== id)); say("Test deleted"); }}
+            onDelete={(id) => {
+              saveTests(tests.filter(t => t.id !== id));
+              say("Test deleted");
+              if (sharedBankEnabled && session) deleteTest(id).catch((e) => { if (!isMissingTableError(e)) say("Removed locally; shared copy may remain: " + (e.message || e), "warn"); });
+            }}
           />
         ) : tab === "suggest" ? (
           <SuggestTab
@@ -1381,7 +1443,7 @@ export default function QuestionBankApp() {
             onSharedSignIn={sharedSignIn}
             onSharedSignOut={sharedSignOut}
             onPublishShared={publishShared}
-            onPullShared={pullShared}
+            onPullShared={pullEverything}
           />
         )}
       </main>
@@ -1411,6 +1473,15 @@ export default function QuestionBankApp() {
       )}
       {importOpen && (
         <ImportModal onClose={() => setImportOpen(false)} onImport={doImport} say={say} />
+      )}
+
+      {migrateTests && (
+        <div className="fixed top-4 left-1/2 px-4 py-3 rounded shadow-lg text-sm z-50 flex items-center gap-3 flex-wrap"
+          style={{ transform: "translateX(-50%)", background: "#fdf0d8", color: INK, border: `1px solid ${MANILA_DEEP}`, maxWidth: "92vw" }}>
+          <span>Push {migrateTests.tests.length} local test{migrateTests.tests.length === 1 ? "" : "s"} to the shared bank so they're saved across devices and visible to other teachers?</span>
+          <button className="qb-btn qb-btn-red" onClick={() => pushLocalTests(migrateTests.tests)} disabled={sharedBusy}><Upload size={14} /> Push {migrateTests.tests.length}</button>
+          <button className="qb-btn qb-btn-ghost" onClick={() => setMigrateTests(null)}>Not now</button>
+        </div>
       )}
 
       {toast && (
@@ -2562,34 +2633,51 @@ function BuildTab({ questions, groups, courseOptions, settings, onFinalize, edit
 }
 
 /* ---------------- Saved tests tab ---------------- */
-function TestsTab({ tests, questionsById, onOpen, onEdit, onExportTest, onDelete }) {
+function TestsTab({ tests, questionsById, myEmail, onOpen, onEdit, onDuplicate, onExportTest, onDelete }) {
   const [confirmDel, setConfirmDel] = useState(null);
-  if (!tests.length) {
-    return <div className="text-center py-12 text-sm" style={{ color: INK_SOFT }}>No saved tests yet — build one and it'll be filed here for reprinting.</div>;
-  }
+  const [scope, setScope] = useState("mine");   // "mine" | "all" (only meaningful when signed in)
+  // A test is "yours" when signed out (local-only), unattributed, or stamped with your email.
+  const owned = (t) => !myEmail || !t.ownerEmail || t.ownerEmail === myEmail;
+  const shown = (myEmail && scope === "mine") ? tests.filter(owned) : tests;
   return (
     <div className="grid gap-3 max-w-2xl">
-      {tests.map(t => {
+      {myEmail && tests.length > 0 && (
+        <div className="flex gap-2 items-center">
+          <span className="qb-stamp" style={{ color: INK_SOFT }}>Show</span>
+          <button className={scope === "mine" ? "qb-btn" : "qb-btn qb-btn-ghost"} onClick={() => setScope("mine")}>Mine</button>
+          <button className={scope === "all" ? "qb-btn" : "qb-btn qb-btn-ghost"} onClick={() => setScope("all")}>Everyone</button>
+        </div>
+      )}
+      {!shown.length ? (
+        <div className="text-center py-12 text-sm" style={{ color: INK_SOFT }}>
+          {tests.length ? "None of yours yet — switch to Everyone to see the team's, or build one." : "No saved tests yet — build one and it'll be filed here for reprinting."}
+        </div>
+      ) : shown.map(t => {
         const live = t.questionIds.filter(id => questionsById[id]).length;
+        const mine = owned(t);
         return (
           <div key={t.id} className="index-card no-rule p-3 pt-2 flex items-center gap-3 flex-wrap">
             <div className="flex-1 min-w-0" style={{ paddingTop: 6 }}>
               <div className="qb-serif font-bold">{t.title}</div>
               <div className="qb-stamp mt-1" style={{ color: INK_SOFT }}>
-                {t.courseLabel || "—"} · {live}/{t.questionIds.length} questions · made {niceDate(t.createdAt)}{t.twoVersions ? " · A/B" : ""}{t.optimize ? " · optimized" : ""}
+                {t.courseLabel || "—"} · {live}/{t.questionIds.length} questions · made {niceDate(t.createdAt)}{t.twoVersions ? " · A/B" : ""}{t.optimize ? " · optimized" : ""}{t.ownerEmail ? <> · by {mine ? "you" : t.ownerEmail}</> : null}
               </div>
             </div>
-            <button className="qb-btn" onClick={() => onEdit(t)}><Pencil size={14} /> Edit</button>
+            {mine ? (
+              <button className="qb-btn" onClick={() => onEdit(t)}><Pencil size={14} /> Edit</button>
+            ) : (
+              <button className="qb-btn" onClick={() => onDuplicate(t)} title="Make your own editable copy"><Copy size={14} /> Duplicate</button>
+            )}
             <button className="qb-btn" onClick={() => onOpen(t)}><Printer size={15} /> Open</button>
             <button className="qb-btn" onClick={() => onExportTest(t)} title="Download this test with its questions"><Download size={14} /> Export</button>
-            {confirmDel === t.id ? (
+            {mine && (confirmDel === t.id ? (
               <>
                 <button className="qb-btn qb-btn-red" onClick={() => { onDelete(t.id); setConfirmDel(null); }}>Delete</button>
                 <button className="qb-btn qb-btn-ghost" onClick={() => setConfirmDel(null)}>Keep</button>
               </>
             ) : (
               <button className="qb-btn qb-btn-ghost" style={{ color: PEN_RED }} onClick={() => setConfirmDel(t.id)} aria-label="Delete test"><Trash2 size={15} /></button>
-            )}
+            ))}
           </div>
         );
       })}
