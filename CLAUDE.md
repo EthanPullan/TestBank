@@ -5,6 +5,10 @@ tests. Vite + React + Tailwind. Deployed to GitHub Pages by
 `.github/workflows/deploy.yml` on every push to `main`. Base path `/TestBank/`.
 Live: https://ethanpullan.github.io/TestBank/
 
+**Full docs:** [`docs/`](docs/) — architecture, data model, shared bank, shared
+tests, Supabase setup/runbook, submissions, printing, operations. This file is the
+terse summary; `docs/` is the long form.
+
 - **Develop on the session's feature branch, then merge to `main`**; pushing to
   `main` auto-deploys.
 - Build/verify: `npm install` then `npm run build` (outputs `dist/`). Preview:
@@ -38,6 +42,14 @@ Live: https://ethanpullan.github.io/TestBank/
 - Migration: first teacher signs in (local bank stays intact), clicks **Publish**
   → seeds the shared bank at rev 1; others pull on reload. A recoverable copy is
   stashed to `bank:localBackup` before the shared bank ever replaces local data.
+- Saved tests: separate table `public.tests` (one row per test; `data jsonb`,
+  `owner uuid default auth.uid()`, `owner_email`, `updated_at`). RLS: select for
+  all `authenticated`, insert/update/delete owner-only. Layer: `listTests` /
+  `upsertTest` / `deleteTest` / `isMissingTableError`. Synced on sign-in & Pull,
+  mirrored on `finalizeTest`; `TestsTab` has a Mine/Everyone filter + owner-only
+  edit/delete (others Duplicate); one-time prompt pushes local-only tests. No
+  seed row needed; degrades to local-only if the table is missing. See
+  `docs/SHARED-TESTS.md`.
 
 ## Status (verified live 2026-06-16)
 Shared bank is deployed **and verified end-to-end**. Infra checks (run against the
@@ -52,6 +64,10 @@ project URL + publishable key) all pass:
 In-browser teacher flow confirmed live: sign-in → auto-pull rev 0 → **Publish →
 rev 1** with `updated_by` recorded. The `main` row now holds the real bank at
 revision 1.
+
+Shared **saved tests** shipped + verified the same day: `public.tests` created,
+anon read `[]`/`200` and anon insert `401` (RLS) confirmed, live on `main`.
+Long-form docs now live in `docs/`.
 
 **Gotcha for any fresh setup:** `publishBank` is UPDATE-only (`update().eq('id',
 'main').eq('revision', expected)`), so the `id='main'` row MUST pre-exist at

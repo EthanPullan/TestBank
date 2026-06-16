@@ -11,9 +11,21 @@ the browser and is deployed as a static site on **GitHub Pages**.
 - Print or download tests + answer keys as standalone HTML
 - Import questions from old tests (paste JSON Claude extracts) and back everything up
 - **Suggest a question:** visitors can propose questions that a maintainer approves
+- **Shared bank (optional):** a few trusted teachers sign in to one live,
+  Supabase-backed bank and Publish/Pull questions and saved tests together
 
 Your bank is stored in the browser's `localStorage`, so it persists between visits
-on the same device. Use **Bank → Back up** to export everything to a file.
+on the same device. Use **Bank → Back up** to export everything to a file. When the
+shared bank is configured (`src/supabaseConfig.js`), signed-in teachers also sync to
+a Supabase project.
+
+## Documentation
+
+Full reference docs live in [`docs/`](./docs/):
+
+- [Architecture](./docs/ARCHITECTURE.md) · [Data model](./docs/DATA-MODEL.md)
+- [Shared question bank](./docs/SHARED-BANK.md) · [Shared saved tests](./docs/SHARED-TESTS.md) · [Supabase setup & runbook](./docs/SUPABASE-SETUP.md)
+- [Suggestions & moderation](./docs/SUBMISSIONS.md) · [Building & printing tests](./docs/PRINTING.md) · [Operations & troubleshooting](./docs/OPERATIONS.md)
 
 ## Develop
 
@@ -76,8 +88,12 @@ index.html                 Vite entry
 src/main.jsx               Mounts the app
 src/QuestionBankApp.jsx    The whole application
 src/config.js              Repo owner/name, submission label, moderation passphrase
+src/sharedBank.js          Supabase layer (auth, shared bank row, tests table)
+src/supabaseConfig.js      Supabase URL + publishable key (blank = file mode)
 src/index.css              Tailwind entry
 public/seed-bank.json      The published bank everyone sees on first visit (full backup)
 .github/workflows/deploy.yml                      Build + deploy to GitHub Pages
 .github/ISSUE_TEMPLATE/question-submission.yml    Manual submission form
+docs/                      Full reference documentation
+CLAUDE.md                  Terse project memory for AI agents
 ```
